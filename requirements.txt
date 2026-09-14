@@ -15,3 +15,8 @@ opencv-contrib-python<5
 protobuf>=4.25.3,<5
 pyvirtualcam
 pillow
+
+# Optional: global hotkeys (--hotkeys), so you can arm/disarm without leaving
+# the meeting tab. Everything works without it; terminal commands are the
+# primary interface and the import is guarded.
+pynput

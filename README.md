@@ -30,14 +30,30 @@ guessed.
 
 ## Setup
 
+One command. It finds a usable Python, builds the virtualenv, installs the
+pinned dependencies, checks the machine, and offers to calibrate:
+
+```bash
+./setup.sh                                          # macOS / Linux
+powershell -ExecutionPolicy Bypass -File setup.ps1  # Windows
+```
+
+Or by hand:
+
 ```bash
 python3.12 -m venv venv
 source venv/bin/activate           # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+python doctor.py
 ```
 
-Python 3.11 or 3.12. Three MediaPipe models (~15 MB) download themselves on
-first run.
+Python 3.9–3.12 (mediapipe 0.10.21 has no wheel for 3.13+). Three MediaPipe
+models (~17 MB) download themselves on first run.
+
+**`python doctor.py` is the thing to run when something is wrong.** It checks
+the Python version, the dependency pins, the models and assets, whose face the
+calibration belongs to, which camera indexes actually work, and whether a
+virtual-camera backend exists — and prints the command that fixes each one.
 
 **Don't unpin the dependencies.** MediaPipe 0.10.30+ (including 1.0.x) ships
 macOS wheels that abort the moment they open a detector, so it's held at
@@ -51,16 +67,30 @@ nothing in the code cares. Unpin one and you have to unpin all three.
 ## Running it
 
 ```bash
+source venv/bin/activate              # every new terminal
 python its_giving_v2.py --calibrate   # once, seven seconds
-python its_giving_v2.py
+python its_giving_v2.py               # starts OFF - plain webcam
 ```
+
+**Calibrate before you rely on it.** A `calibration.json` ships in this repo and
+it is somebody else's resting face. It is valid JSON, so it loads without any
+warning and quietly measures your expressions against a stranger's neutral.
+`doctor.py` flags it.
+
+**It starts with the memes off.** The virtual camera runs and carries your
+ordinary face; nothing fires until you arm it. See
+[Arming and disarming](#arming-and-disarming) below, or `MEET_SETUP.md` for the
+full Google Meet walkthrough.
 
 | key | does |
 |---|---|
 | `q` | quit |
 | `d` | toggle the HUD |
 | `c` | recalibrate |
-| `1`–`9` `0` `-` `=` `[` `]` | force a reaction on screen for 2 seconds |
+| `space` | off — plain webcam |
+| `n` | manual — armed, command-only |
+| `m` | toggle off / last armed mode |
+| `1`–`9` `0` `-` `=` `[` `]` | force a reaction on screen for ~2.5 seconds |
 
 ---
 
@@ -89,9 +119,52 @@ Meet, Teams and Discord all have the same setting under Video.
 **Start this before your meeting app.** Most of them scan for cameras once at
 launch and won't notice a device that appeared later.
 
-A few things worth knowing before you turn it on in front of colleagues. It
-fires on its own. Everyone sees whatever it decides, so try it on a call with
-someone who likes you first. 
+**Don't quit it for a serious meeting.** Killing the script removes the camera
+device and your meeting app shows a black rectangle, which is worse than a meme.
+Leave it running and set it to `off` instead — that is what the modes are for.
+
+---
+
+## Arming and disarming
+
+Three modes. It starts in `off`.
+
+| mode | detectors | what the call sees |
+|---|---|---|
+| `off` *(default)* | not running at all | your plain webcam |
+| `manual` | running | your face, plus a meme **only** when you name one |
+| `auto` | running | reactions fire on their own |
+
+In `off` the frame is a straight pass-through: the MediaPipe calls are skipped
+entirely, so there is no code path that can draw anything. Type commands into
+the terminal running the script:
+
+| command | effect |
+|---|---|
+| *(blank Enter)* | **panic — straight to off.** Smash it. |
+| `off` / `panic` | plain webcam |
+| `manual` | armed, command-only |
+| `auto` | reactions fire on their own |
+| `auto 45` | auto for 45 seconds, then back to off **by itself** |
+| `heart`, `crash`, `2` | fire that reaction (prefix or number both work) |
+| `hold heart` / `clear` | stick one up until cleared |
+| `list` / `status` / `help` / `quit` | … |
+
+`--mode manual` or `--mode auto` changes what it starts in. `--hotkeys` adds
+global shortcuts via pynput (`ctrl+alt+M` toggle, `ctrl+alt+N` manual,
+`ctrl+alt+.` off, `ctrl+alt+1-9 0 - = [ ]` fire that meme) so you needn't
+leave the meeting tab.
+
+The timed arm is the one to build a habit around. The realistic mistake isn't
+forgetting to switch it on — it's forgetting it's still on two hours later, so
+`auto 60` before a call with friends means it cannot still be armed when
+someone who matters dials in.
+
+Two honest warnings. **`auto` misfires**: `talking_to_wall` triggers on hands
+moving in frame and `suspicious` on a turned head plus a squint, so an ordinary
+explaining-something gesture can set it off — `manual` is the mode for anything
+where funny is a bonus rather than the point. And **check the room before you
+arm it**: calls get recorded, and a recording outlives the joke.
 
 ---
 
@@ -241,6 +314,11 @@ nose scrunch            z +19.3           z  +5.5        both fire
 ```
 its_giving_v2.py   the calibrated version — the one to use
 its_giving.py      v1: same poses, fixed thresholds
+meme_control.py    the off / manual / auto layer and its commands
+doctor.py          checks this machine can run it, and says what to fix
+setup.sh           one-command install (macOS / Linux)
+setup.ps1          one-command install (Windows)
+MEET_SETUP.md      Google Meet walkthrough, and what to do when it breaks
 calibration.json   your neutral face (made by --calibrate, gitignored)
 requirements.txt   pinned on purpose — read the comments before changing them
 assets/            the memes, named after their pose

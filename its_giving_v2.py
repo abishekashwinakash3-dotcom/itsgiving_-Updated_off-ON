@@ -9,7 +9,11 @@ Seven seconds of calibration; see README.md.
   python its_giving_v2.py --calibrate
   python its_giving_v2.py [--camera 1] [--no-vcam] [--size 640x480] [--no-flip]
 
-Keys:  q quit   d toggle HUD   c recalibrate   1-9 0 - = [ ] force-show a pose
+Memes are OFF by default: the virtual camera carries your plain webcam until you
+arm it. See MEET_SETUP.md. Modes: off / manual / auto, driven by typed commands.
+
+Keys:  q quit   d HUD   c recalibrate   space off   n manual   m toggle
+       1-9 0 - = [ ] force-show a pose
 """
 import argparse
 import json
@@ -17,6 +21,7 @@ import os
 import platform
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -26,6 +31,8 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
 
+from meme_control import Controller, draw_badge
+
 POSES = ["time_out", "heart", "cover_nose", "crashing_out", "dance", "nose_closed", "flirty", "hand_up",
          "tongue_out", "open_mouth", "disgusted", "talking_to_wall", "suspicious", "spin"]
 TEST_KEYS = "1234567890-=[]"
@@ -33,7 +40,7 @@ TEST_KEYS = "1234567890-=[]"
 FACE_SCALE = 2.0
 HOLD_FRAMES = 10
 ARM = {
-    "spin": 15, "suspicious": 8, "talking_to_wall": 6, "dance": 6, "crashing_out": 4,
+    "spin": 15, "suspicious": 12, "talking_to_wall": 6, "dance": 6, "crashing_out": 4,
     "open_mouth": 4, "tongue_out": 5, "disgusted": 5,
 }
 
@@ -55,7 +62,8 @@ FLOOR = dict(
 )
 T = dict(
     tongue=0.5,
-    head_turn=0.15,
+    head_turn=0.22,     # 0.15 fired on a glance at another window
+
     gesture=0.035,
 )
 
@@ -422,6 +430,7 @@ class Body:
     def __init__(self, lms, W, H):
         p = np.array([[l.x * W, l.y * H] for l in lms], np.float32)
         self.shoulders, self.elbows, self.wrists = p[[11, 12]], p[[13, 14]], p[[15, 16]]
+        self.wrist_vis = min(getattr(lms[i], "visibility", 1.0) for i in (15, 16))
         vis = [getattr(lms[i], "visibility", 1.0) for i in (11, 12, 13, 14)]
         self.seen = min(vis) > 0.5
         shoulder_y = float(self.shoulders[:, 1].mean())
@@ -474,6 +483,92 @@ class Motion:
         self.energy = 0.8 * self.energy + 0.2 * speed
         self.prev = cur
         return self.energy
+
+
+DETECT_WIDTH = 640   # MediaPipe resizes internally; converting a bigger frame only costs time
+
+
+class Detection:
+    __slots__ = ("seq", "frame", "face", "hands", "body")
+
+    def __init__(self, seq, frame, face, hands, body):
+        self.seq, self.frame, self.face, self.hands, self.body = seq, frame, face, hands, body
+
+
+class DetectWorker:
+    """Runs the three detectors on the newest frame in a background thread.
+
+    Inline, the virtual camera only gets a frame once all three models finish
+    (~85 ms at 640x480, ~120 ms at 1280x720 on a laptop CPU), so Meet drops to
+    8-11 fps the moment you arm it. Here the main loop keeps sending every
+    webcam frame and picks up results as they land; the meme trails your head
+    by one detection, which is invisible at meme scale. Frames that arrive
+    while a detection is running are dropped, never queued.
+    """
+
+    def __init__(self, face_det, hand_det, pose_det, clock, W, H):
+        self.dets = (face_det, hand_det, pose_det)
+        self.clock, self.W, self.H = clock, W, H
+        self.busy = threading.Lock()        # held while the detectors are in use
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._pending, self._latest, self._seq = None, None, 0
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True, name="detect")
+        self._thread.start()
+
+    def submit(self, frame):
+        with self._lock:
+            self._pending = frame
+        self._wake.set()
+
+    def latest(self):
+        with self._lock:
+            return self._latest
+
+    def seq(self):
+        with self._lock:
+            return self._seq
+
+    def _run(self):
+        face_det, hand_det, pose_det = self.dets
+        W, H = self.W, self.H
+        while not self._stop:
+            if not self._wake.wait(0.2):
+                continue
+            self._wake.clear()
+            with self._lock:
+                frame, self._pending = self._pending, None
+            if frame is None:
+                continue
+            small = frame
+            if W > DETECT_WIDTH:
+                small = cv2.resize(frame, (DETECT_WIDTH, int(H * DETECT_WIDTH / W)),
+                                   interpolation=cv2.INTER_AREA)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+            try:
+                with self.busy:
+                    ts = self.clock.next()
+                    fr = face_det.detect_for_video(mp_img, ts)
+                    hr = hand_det.detect_for_video(mp_img, ts)
+                    pr = pose_det.detect_for_video(mp_img, ts)
+            except Exception as e:          # a bad frame must never kill the camera
+                print(f"! detector error: {e}")
+                continue
+            # Landmarks are normalised, so scaling by the full W, H puts them
+            # back on the full-size frame even when detection ran on `small`.
+            face = Face(fr.face_landmarks[0], fr.face_blendshapes[0] if fr.face_blendshapes else None, W, H) \
+                if fr.face_landmarks else None
+            hands = [Hand(h, W, H) for h in hr.hand_landmarks]
+            body = Body(pr.pose_landmarks[0], W, H) if pr.pose_landmarks else None
+            with self._lock:
+                self._seq += 1
+                self._latest = Detection(self._seq, frame, face, hands, body)
+
+    def close(self):
+        self._stop = True
+        self._wake.set()
+        self._thread.join(timeout=2)
 
 
 def measure(face, base):
@@ -532,7 +627,10 @@ def decide(face, hands, body, tongue, gesture, m):
         return ("crashing_out" if screaming else "dance"), d
 
     for h in hands:
-        if near(h.thumb, face.nose, 0.35) and near(h.index, face.nose, 0.35) and near(h.thumb, h.index, 0.3):
+        # Measured on a real pinch: index 0.22, thumb 0.41-0.43, gap 0.45-0.48
+        # face-widths (the fingers sit either side of the nose, not together).
+        # The old 0.35 / 0.35 / 0.30 never matched it.
+        if near(h.thumb, face.nose, 0.48) and near(h.index, face.nose, 0.35) and near(h.thumb, h.index, 0.55):
             return "nose_closed", d
         if near(h.index, face.mouth, 0.22) and not near(h.palm, face.mouth, 0.3):
             return "flirty", d
@@ -545,11 +643,45 @@ def decide(face, hands, body, tongue, gesture, m):
         return "open_mouth", d
     if over("sneer", m, "z_sneer", "sneer") or m["z_disgust"] >= Z["disgust"]:
         return "disgusted", d
-    if hands and gesture > T["gesture"]:
+    # A hand held at the face (pinching the nose, over the mouth) jitters enough
+    # to read as motion; in traces that stole those poses as talking_to_wall.
+    # Talking to a wall is hands waving away from the face.
+    at_face = any(near(h.index, face.nose, 0.5) or near(h.palm, face.mouth, 0.8) for h in hands)
+    if hands and gesture > T["gesture"] and not at_face:
         return "talking_to_wall", d
     if m["turn"] > T["head_turn"] and over("squint", m, "z_squint", "squint"):
         return "suspicious", d
     return None, d
+
+
+TRACE_HEADER = ("t,mode,raw,hands,turn,z_squint,squint,jaw,gesture,"
+                "nose_thumb,nose_index,pinch,palm_mouth_1,palm_mouth_2,"
+                "wrist_mouth_1,wrist_mouth_2,wrist_vis\n")
+
+
+def trace_row(t, mode, raw, face, hands, body, m, gesture):
+    """One CSV line of what decide() saw, distances in face-widths, so thresholds
+    can be tuned from your measurements instead of guessed."""
+    cols = [f"{t:.2f}", mode, raw or "", str(len(hands))]
+    if face is None:
+        return ",".join(cols + [""] * 13) + "\n"
+    fw = face.w
+    cols += [f"{m['turn']:.3f}", f"{m['z_squint']:.1f}", f"{m['squint']:.2f}", f"{m['jaw']:.2f}",
+             f"{gesture:.3f}"]
+    if hands:
+        h = min(hands, key=lambda h: dist(h.index, face.nose))
+        cols += [f"{dist(h.thumb, face.nose) / fw:.2f}", f"{dist(h.index, face.nose) / fw:.2f}",
+                 f"{dist(h.thumb, h.index) / fw:.2f}"]
+    else:
+        cols += ["", "", ""]
+    pm = sorted(dist(h.palm, face.mouth) / fw for h in hands)[:2]
+    cols += [f"{v:.2f}" for v in pm] + [""] * (2 - len(pm))
+    # The pose model tracks wrists even when the hand model loses a palm
+    # pressed against the face.
+    wm = sorted(dist(w, face.mouth) / fw for w in body.wrists)[:2] if body is not None else []
+    cols += [f"{v:.2f}" for v in wm] + [""] * (2 - len(wm))
+    cols.append(f"{body.wrist_vis:.2f}" if body is not None else "")
+    return ",".join(cols) + "\n"
 
 
 def draw_hud(img, shown, raw, d, face, hands, body, base):
@@ -591,6 +723,12 @@ def main():
     ap.add_argument("--skip-check", action="store_true", help="skip the MediaPipe startup check")
     ap.add_argument("--size", default="1280x720", help="capture size, e.g. 1280x720 or 640x480 (lower = faster)")
     ap.add_argument("--no-flip", action="store_true", help="don't mirror the image")
+    ap.add_argument("--mode", default="off", choices=("off", "manual", "auto"),
+                    help="starting state (default: off — plain webcam, detectors idle)")
+    ap.add_argument("--hotkeys", action="store_true",
+                    help="global hotkeys via pynput, so you needn't leave the Meet tab")
+    ap.add_argument("--trace", metavar="CSV",
+                    help="write every armed detection's measurements to CSV, for tuning thresholds")
     args = ap.parse_args()
 
     calib_path = os.path.join(HERE, CALIB_FILE)
@@ -622,7 +760,7 @@ def main():
     print(f"Camera {args.camera}: {W}x{H}")
 
     clock = Clock()
-    window = "it's giving v2  (q quit, d HUD, c recalibrate, 1-9 0 - = [ ] test)"
+    window = "it's giving v2  (space off, n manual, m toggle, d HUD, q quit)"
 
     if args.calibrate:
         face_det = vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
@@ -653,13 +791,27 @@ def main():
             print(f"Virtual camera unavailable ({e}). Preview-only.")
 
     face_det, hand_det, pose_det = build_detectors(model_paths)
+    worker = DetectWorker(face_det, hand_det, pose_det, clock, W, H)
     motion = Motion()
     shown, hold, show_hud = None, 0, True
     arm = {p: 0 for p in POSES}
     shown_since = 0.0
-    forced, forced_until = None, 0.0
+    last_seq = 0
+    face, hands, body, raw, dbg = None, [], None, None, {}
+    quit_armed = -10.0
+    trace = None
+    if args.trace:
+        trace = open(args.trace, "w", buffering=1)
+        trace.write(TRACE_HEADER)
+        print(f"Tracing detections to {args.trace}")
     sm_center, sm_h = np.array([W / 2, H / 2], np.float32), H * 0.45
-    print("Running. Focus the preview window: q quit, d HUD, c recalibrate, 1-9 0 - = [ ] test a pose")
+
+    ctl = Controller(POSES, mode=args.mode)
+    ctl.start_console()
+    if args.hotkeys:
+        ctl.start_hotkeys()
+    print(ctl.help_text())
+    print(f"Running in [{ctl.mode}]. Type a command here, or use the keys in the preview window.")
 
     try:
         while True:
@@ -672,42 +824,63 @@ def main():
             if not args.no_flip:
                 frame = cv2.flip(frame, 1)
 
-            ts = clock.next()
-            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            fr = face_det.detect_for_video(mp_img, ts)
-            hr = hand_det.detect_for_video(mp_img, ts)
-            pr = pose_det.detect_for_video(mp_img, ts)
-            face = Face(fr.face_landmarks[0], fr.face_blendshapes[0] if fr.face_blendshapes else None, W, H) \
-                if fr.face_landmarks else None
-            hands = [Hand(h, W, H) for h in hr.hand_landmarks]
-            body = Body(pr.pose_landmarks[0], W, H) if pr.pose_landmarks else None
-
-            m = measure(face, base) if face is not None else {}
-            tongue = tongue_score(frame, face, hands,
-                                  over("tongue_jaw", m, "z_jaw", "jaw")) if face is not None else 0.0
-            gesture = motion.update(hands, face)
-            raw, dbg = decide(face, hands, body, tongue, gesture, m)
-
-            fired = None
-            for p in POSES:
-                arm[p] = arm[p] + 1 if raw == p else 0
-                if raw == p and arm[p] >= ARM.get(p, 3):
-                    fired = p
             now = time.monotonic()
-            if forced and now < forced_until:
-                fired = forced
-            if fired:
-                if fired != shown:
-                    shown_since = now
-                shown, hold = fired, HOLD_FRAMES
-            elif hold > 0:
-                hold -= 1
-            else:
-                shown = None
+            ctl.tick(now)
+            if ctl.consume_dirty():          # mode just changed - drop stale state
+                motion, shown, hold = Motion(), None, 0
+                arm = {p: 0 for p in POSES}
+                face, hands, body, raw, dbg = None, [], None, None, {}
+                last_seq = worker.seq()      # ignore results from before the change
 
-            if face is not None:
-                sm_center = 0.7 * sm_center + 0.3 * np.array(face.center, np.float32)
-                sm_h = 0.7 * sm_h + 0.3 * face.h * FACE_SCALE
+            if ctl.mode == "off":
+                # No detection, no overlay. `frame` reaches the virtual camera
+                # exactly as the webcam produced it.
+                shown, hold = None, 0
+            else:
+                worker.submit(frame.copy())  # copy: the overlay below draws on `frame`
+                fired = ctl.take_forced(now)     # a named meme always wins, and shows at once
+                det = worker.latest()
+                if det is not None and det.seq != last_seq:
+                    # A fresh detection. Everything counted in frames (ARM,
+                    # HOLD_FRAMES, the motion filter, smoothing) advances here,
+                    # once per detection, so its timing is what it was inline.
+                    last_seq = det.seq
+                    face, hands, body = det.face, det.hands, det.body
+                    m = measure(face, base) if face is not None else {}
+                    tongue = tongue_score(det.frame, face, hands,
+                                          over("tongue_jaw", m, "z_jaw", "jaw")) if face is not None else 0.0
+                    gesture = motion.update(hands, face)
+                    raw, dbg = decide(face, hands, body, tongue, gesture, m)
+                    if trace:
+                        trace.write(trace_row(now, ctl.mode, raw, face, hands, body, m, gesture))
+
+                    auto = None
+                    for p in POSES:
+                        arm[p] = arm[p] + 1 if raw == p else 0
+                        if ctl.mode == "auto" and raw == p and arm[p] >= ARM.get(p, 3):
+                            auto = p
+                    if auto and not fired and auto != shown:
+                        # Once per appearance, so you can tell afterwards what
+                        # your face set off (named memes already log "-> pose").
+                        why = (f"  (turn {dbg.get('turn', 0):.2f} / {T['head_turn']:.2f}, "
+                               f"squint {dbg.get('z_squint', 0):+.1f}s / {Z['squint']:.0f})"
+                               if auto == "suspicious" else "")
+                        print(f"[auto {time.strftime('%H:%M:%S')}] {auto}{why}")
+                    fired = fired or auto
+
+                    if face is not None:
+                        sm_center = 0.7 * sm_center + 0.3 * np.array(face.center, np.float32)
+                        sm_h = 0.7 * sm_h + 0.3 * face.h * FACE_SCALE
+                    if not fired:
+                        if hold > 0:
+                            hold -= 1
+                        else:
+                            shown = None
+
+                if fired:
+                    if fired != shown:
+                        shown_since = now
+                    shown, hold = fired, HOLD_FRAMES
 
             if shown:
                 asset = assets[shown]
@@ -721,27 +894,45 @@ def main():
                 vcam.send(frame)
                 vcam.sleep_until_next_frame()
 
-            preview = frame
+            preview = frame.copy()
             if show_hud:
-                preview = frame.copy()
                 draw_hud(preview, shown, raw, dbg, face, hands, body, base)
+            draw_badge(preview, ctl)        # preview only - never sent to Meet
             cv2.imshow(window, preview)
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+            if ctl.quit:
                 break
+            if key == ord("q"):
+                # Quitting removes the camera device and Meet goes black, so a
+                # stray keypress in the preview must not do it: q twice in 2 s.
+                if now - quit_armed < 2.0:
+                    break
+                quit_armed = now
+                print("press q again within 2s to quit - Meet's camera goes black when this closes")
             if key == ord("d"):
                 show_hud = not show_hud
+            elif key == ord("m"):
+                print(ctl.handle("toggle"))
+            elif key == ord("n"):
+                print(ctl.handle("manual"))
+            elif key == ord(" "):
+                print(ctl.handle("off"))
             elif key == ord("c"):
-                new = run_calibration(cap, face_det, clock, args, W, H, window)
+                with worker.busy:            # the worker must not touch face_det meanwhile
+                    new = run_calibration(cap, face_det, clock, args, W, H, window)
                 if new is not None:
                     base = new
                     base.save(calib_path)
                     print(f"Saved {CALIB_FILE}.")
                 motion, shown, hold = Motion(), None, 0
                 arm = {p: 0 for p in POSES}
+                last_seq = worker.seq()
             elif 0 < key < 256 and chr(key) in TEST_KEYS:
-                forced, forced_until = POSES[TEST_KEYS.index(chr(key))], now + 2.0
+                print(ctl.fire(POSES[TEST_KEYS.index(chr(key))]))
     finally:
+        if trace:
+            trace.close()
+        worker.close()
         cap.release()
         face_det.close()
         hand_det.close()
